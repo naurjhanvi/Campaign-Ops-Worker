@@ -47,6 +47,15 @@ def call_model(messages):
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:500]
+        try:
+            error_payload = json.loads(detail)
+            error_message = error_payload.get("error", {}).get("message", "")
+        except (TypeError, ValueError, AttributeError):
+            error_message = detail
+        if exc.code == 404 and "not found" in error_message.lower() and "11434" in BASE_URL:
+            raise RuntimeError(
+                f"Ollama does not have model '{MODEL}'. In PowerShell, run `ollama pull {MODEL}`, then retry the investigation."
+            ) from exc
         raise RuntimeError(f"Configured model endpoint returned HTTP {exc.code}: {detail}") from exc
     except (urllib.error.URLError, TimeoutError) as exc:
         raise RuntimeError(f"Could not reach the configured model API: {exc}") from exc
