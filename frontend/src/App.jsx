@@ -89,7 +89,7 @@ function App() {
 
     <main className="main-content">
       <header className="topbar"><div className="breadcrumb">Workspace <ChevronRight size={14} /> <strong>Campaign health</strong></div><div className="topbar-right"><span className="live-indicator"><i /> Local demo</span><span className="topbar-date">Sunday, October 4, 2026</span></div></header>
-      <section className="page-heading"><div><div className="eyebrow">OPERATIONS OVERVIEW <span>·</span> LAST 24 HOURS</div><h1>Campaign health</h1><p>Monitor conversion data and investigate issues with your AI operations worker.</p></div><button className="button button-quiet" onClick={resetDemo} disabled={busy}><RotateCcw size={15} /> Reset demo</button></section>
+      <section className="page-heading"><div><div className="eyebrow">OPERATIONS OVERVIEW <span>·</span> LAST 24 HOURS</div><h1>Campaign health</h1><p>Monitor conversion data and investigate issues with the local operations worker.</p></div><button className="button button-quiet" onClick={resetDemo} disabled={busy}><RotateCcw size={15} /> Reset demo</button></section>
       {error && <div className="banner banner-error"><CircleAlert size={16} /> {error}</div>}
       {notice && <div className="banner banner-info"><Check size={16} /> {notice}</div>}
 
@@ -117,7 +117,7 @@ function App() {
         </section>
       </div>
 
-      <section className="worker-panel panel"><div className="worker-title"><div className="worker-emblem"><Sparkles size={17} /></div><div><h2>Ask the operations worker</h2><p>Describe an outcome. The worker will investigate, use tools, and ask before changing data.</p></div><span className="powered-by">AI WORKER <span>·</span> SANDBOX</span></div>
+      <section className="worker-panel panel"><div className="worker-title"><div className="worker-emblem"><Sparkles size={17} /></div><div><h2>Ask the operations worker</h2><p>Describe a supported campaign issue. The worker will investigate and ask before changing data.</p></div><span className="powered-by">LOCAL RULES <span>·</span> SANDBOX</span></div>
         <form onSubmit={runTask} className="task-form"><textarea id="task-input" value={task} onChange={(e) => setTask(e.target.value)} placeholder="e.g. Investigate the conversion spike for Autumn Launch..." rows={2} /><div className="task-form-bottom"><div className="demo-chips">{DEMOS.map((d) => <button key={d.label} type="button" className="demo-chip" onClick={() => setTask(d.task)}>{d.label}</button>)}</div><button className="button button-primary" type="submit" disabled={busy || task.trim().length < 5}>{busy ? <><LoaderCircle size={15} className="spin" /> Working</> : <><Play size={14} fill="currentColor" /> Run investigation</>}</button></div></form>
         <div className="worker-tools"><span>AVAILABLE TOOLS</span><i /><span>Campaign metrics</span><i /><span>Event records</span><i /><span>Runbooks</span><i /><span>Approval-gated repair</span><button className="simulate-button" onClick={startFailureDemo} title="Cause one temporary read error for the next run"><Wrench size={13} /> Simulate transient failure</button></div>
       </section>

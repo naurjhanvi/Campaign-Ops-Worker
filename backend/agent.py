@@ -1,7 +1,5 @@
 import json
-import os
-import urllib.error
-import urllib.request
+import re
 from uuid import uuid4
 
 from db import connection
@@ -9,57 +7,128 @@ from tools import (ToolFailure, get_campaign_metrics, inspect_events, list_campa
                    prepare_remediation, search_runbooks)
 
 
-MODEL = os.getenv("LLM_MODEL", "qwen3:8b")
-BASE_URL = os.getenv("LLM_BASE_URL", "http://host.docker.internal:11434/v1").rstrip("/")
-API_KEY = os.getenv("LLM_API_KEY", "ollama")
 MAX_TOOL_ROUNDS = 10
+DEMO_DATE = "2026-10-04"
 
-SYSTEM_PROMPT = """You are an operations worker for a simulated campaign analytics system.
-Your job is to investigate the user's goal and use the available tools. Do not claim that
-anything changed unless an approved action was applied and a verification read succeeded.
-Start by discovering the relevant campaign and date if the request is not explicit. Inspect
-both aggregate metrics and event-level evidence. Search the runbook and follow its safety
-rules. For a safe repair, call prepare_remediation only after collecting evidence; it returns
-a preview and pauses for human approval. Do not invent IDs or data. If there are multiple
-plausible campaigns, dates, or source mappings, call ask_clarification and stop. Tool errors
-are observations: retry a transient read once when appropriate, then explain the failure.
-After approval, verify metrics and inspect the affected event state. Keep the final report
-concise and include concrete evidence. You may only access this simulated application through
-the listed tools; never write arbitrary SQL or call external services."""
+SYSTEM_PROMPT = """Local campaign operations workflow. This prompt is retained in the per-run
+audit conversation; execution uses the deterministic policy in this service and never calls
+an external model. Supported repairs require matching campaign and issue intent, evidence from
+the local database and runbook, explicit operator approval, and a successful verification read."""
 
-TOOLS = [
-    {"type": "function", "function": {"name": "list_campaigns", "description": "List campaigns and their source codes.", "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}},
-    {"type": "function", "function": {"name": "get_campaign_metrics", "description": "Read conversion metrics and unattributed counts for one campaign and day.", "parameters": {"type": "object", "properties": {"campaign_id": {"type": "string"}, "event_date": {"type": "string", "description": "YYYY-MM-DD"}}, "required": ["campaign_id", "event_date"], "additionalProperties": False}}},
-    {"type": "function", "function": {"name": "inspect_events", "description": "Inspect conversion delivery rows; issue can be all, duplicates, or unattributed.", "parameters": {"type": "object", "properties": {"campaign_id": {"type": "string"}, "event_date": {"type": "string"}, "issue": {"type": "string", "enum": ["all", "duplicates", "unattributed"]}}, "required": ["campaign_id", "event_date"], "additionalProperties": False}}},
-    {"type": "function", "function": {"name": "search_runbooks", "description": "Search the local operator runbooks for safe diagnosis and remediation steps.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"], "additionalProperties": False}}},
-    {"type": "function", "function": {"name": "prepare_remediation", "description": "Create a safe preview; any resulting change waits for explicit user approval.", "parameters": {"type": "object", "properties": {"action_type": {"type": "string", "enum": ["quarantine_duplicate_deliveries", "repair_unattributed_events"]}, "campaign_id": {"type": "string"}, "event_date": {"type": "string"}}, "required": ["action_type", "campaign_id", "event_date"], "additionalProperties": False}}},
-    {"type": "function", "function": {"name": "ask_clarification", "description": "Pause and ask the user a specific question when the task cannot safely proceed.", "parameters": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"], "additionalProperties": False}}},
-]
+def _users(messages):
+    return [message.get("content", "") for message in messages if message.get("role") == "user"]
 
 
-def call_model(messages):
-    if not API_KEY:
-        raise RuntimeError("LLM_API_KEY is blank. Set it to 'ollama' for local Ollama or provide the key for your configured endpoint.")
-    body = json.dumps({"model": MODEL, "messages": messages, "tools": TOOLS, "tool_choice": "auto", "temperature": 0.1, "stream": False}).encode("utf-8")
-    req = urllib.request.Request(f"{BASE_URL}/chat/completions", data=body, headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:500]
-        try:
-            error_payload = json.loads(detail)
-            error_message = error_payload.get("error", {}).get("message", "")
-        except (TypeError, ValueError, AttributeError):
-            error_message = detail
-        if exc.code == 404 and "not found" in error_message.lower() and "11434" in BASE_URL:
-            raise RuntimeError(
-                f"Ollama does not have model '{MODEL}'. In PowerShell, run `ollama pull {MODEL}`, then retry the investigation."
-            ) from exc
-        raise RuntimeError(f"Configured model endpoint returned HTTP {exc.code}: {detail}") from exc
-    except (urllib.error.URLError, TimeoutError) as exc:
-        raise RuntimeError(f"Could not reach the configured model API: {exc}") from exc
-    return payload["choices"][0]["message"]
+def _task_context(messages):
+    user_messages = _users(messages)
+    text = " ".join(user_messages).lower()
+    date_match = re.search(r"\b\d{4}-\d{2}-\d{2}\b", " ".join(user_messages))
+    event_date = date_match.group(0) if date_match else DEMO_DATE
+
+    campaigns = {
+        "CMP-101": ("autumn launch", "autumn_launch"),
+        "CMP-202": ("creator referral", "creator_referral"),
+        "CMP-303": ("northstar retargeting", "northstar_retargeting"),
+    }
+    campaign_id = next(
+        (campaign_id for campaign_id, names in campaigns.items()
+         if campaign_id.lower() in text or any(name in text for name in names)),
+        None,
+    )
+    duplicate_terms = ("duplicate", "repeated delivery", "conversion spike", "spike", "overcount")
+    attribution_terms = ("attribution", "unattributed", "missing campaign", "mapping gap", "conversion drop")
+    wants_duplicates = any(term in text for term in duplicate_terms)
+    wants_attribution = any(term in text for term in attribution_terms)
+    issue = "duplicates" if wants_duplicates and not wants_attribution else "unattributed" if wants_attribution and not wants_duplicates else None
+    return {"campaign_id": campaign_id, "event_date": event_date, "issue": issue}
+
+
+def _called_tools(messages):
+    calls = []
+    results = {}
+    for message in messages:
+        if message.get("role") == "assistant":
+            calls.extend(message.get("tool_calls") or [])
+        elif message.get("role") == "tool":
+            try:
+                results[message.get("tool_call_id")] = json.loads(message.get("content") or "{}")
+            except (TypeError, ValueError):
+                results[message.get("tool_call_id")] = {}
+    return calls, results
+
+
+def _tool_step(name, arguments):
+    call = {"id": str(uuid4()), "type": "function", "function": {"name": name, "arguments": json.dumps(arguments)}}
+    return {"role": "assistant", "content": None, "tool_calls": [call]}
+
+
+def _clarification(context):
+    if context["campaign_id"] is None and context["issue"] is None:
+        question = "Which campaign should I investigate, and is the issue repeated deliveries or missing attribution?"
+    elif context["campaign_id"] is None:
+        question = "Which campaign should I investigate: Autumn Launch, Creator Referral, or Northstar Retargeting?"
+    else:
+        question = "Should I investigate repeated deliveries or missing campaign attribution?"
+    return _tool_step("ask_clarification", {"question": question})
+
+
+def next_worker_step(messages):
+    """Choose the next bounded local workflow step without calling a model or network."""
+    context = _task_context(messages)
+    calls, results = _called_tools(messages)
+    if calls and calls[-1]["function"]["name"] == "ask_clarification":
+        answer_result = results.get(calls[-1]["id"], {})
+        if answer_result.get("needs_input") and len(_users(messages)) < 2:
+            return _clarification(context)
+
+    if context["campaign_id"] is None or context["issue"] is None:
+        return _clarification(context)
+
+    completed = [(call["function"]["name"], results.get(call["id"], {})) for call in calls]
+    last_name, last_result = completed[-1] if completed else (None, {})
+    campaign_id = context["campaign_id"]
+    event_date = context["event_date"]
+    issue = context["issue"]
+
+    if last_name is None or last_name == "ask_clarification":
+        return _tool_step("list_campaigns", {})
+    if last_name == "list_campaigns":
+        if last_result.get("retryable"):
+            return _tool_step("list_campaigns", {})
+        if last_result.get("error"):
+            return {"role": "assistant", "content": f"I stopped because campaign data could not be read: {last_result['error']}"}
+        matches = [campaign for campaign in last_result if campaign["campaign_id"] == campaign_id]
+        if len(matches) != 1:
+            return _clarification(context)
+        return _tool_step("get_campaign_metrics", {"campaign_id": campaign_id, "event_date": event_date})
+    if last_name == "get_campaign_metrics" and "verification" not in last_result:
+        if last_result.get("error"):
+            return {"role": "assistant", "content": f"I could not read campaign metrics: {last_result['error']}"}
+        return _tool_step("inspect_events", {"campaign_id": campaign_id, "event_date": event_date, "issue": issue})
+    if last_name == "inspect_events":
+        if last_result.get("count", 0) == 0:
+            return {"role": "assistant", "content": "I found no eligible events for this issue and date, so I did not prepare a change."}
+        query = "duplicate conversion deliveries" if issue == "duplicates" else "missing campaign attribution"
+        return _tool_step("search_runbooks", {"query": query})
+    if last_name == "search_runbooks":
+        if not last_result:
+            return {"role": "assistant", "content": "I could not find a matching safety runbook, so I stopped without preparing a change."}
+        action_type = "quarantine_duplicate_deliveries" if issue == "duplicates" else "repair_unattributed_events"
+        return _tool_step("prepare_remediation", {"action_type": action_type, "campaign_id": campaign_id, "event_date": event_date})
+    if last_name == "prepare_remediation":
+        if last_result.get("approved"):
+            return _tool_step("get_campaign_metrics", {"campaign_id": campaign_id, "event_date": event_date})
+        if last_result.get("awaiting_approval"):
+            return {"role": "assistant", "content": "The proposed change is ready for your review."}
+        return {"role": "assistant", "content": f"I could not prepare a safe change: {last_result.get('error', 'The preview could not be prepared.')}"}
+    if last_name == "get_campaign_metrics" and last_result.get("verification"):
+        verification = last_result["verification"]
+        if verification.get("ok"):
+            return {"role": "assistant", "content": f"The approved repair is complete and verified. The campaign now has {verification['actual_attributed_conversions']} attributed conversions."}
+        return {"role": "assistant", "content": "The approved repair was applied, but the verification check did not pass. Review the event and metric evidence before taking further action."}
+    if last_result.get("error"):
+        return {"role": "assistant", "content": f"I stopped after a tool error: {last_result['error']}"}
+    return {"role": "assistant", "content": "The local workflow reached a state it cannot safely continue from."}
 
 
 def record_event(run_id, kind, details, tool_name=None):
@@ -153,7 +222,7 @@ def run_loop(run_id):
     messages = list(run["messages"])
     try:
         for _ in range(MAX_TOOL_ROUNDS):
-            reply = call_model(messages)
+            reply = next_worker_step(messages)
             assistant_message = {k: reply[k] for k in ("role", "content", "tool_calls") if k in reply}
             messages.append(assistant_message)
             calls = reply.get("tool_calls") or []

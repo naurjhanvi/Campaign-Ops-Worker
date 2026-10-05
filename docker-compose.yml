@@ -17,7 +17,6 @@ services:
 
   api:
     build: ./backend
-    env_file: .env
     environment:
       DATABASE_URL: postgresql://worker:worker@db:5432/campaign_ops
     ports:
