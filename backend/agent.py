@@ -108,7 +108,21 @@ def next_worker_step(messages):
         return _tool_step("inspect_events", {"campaign_id": campaign_id, "event_date": event_date, "issue": issue})
     if last_name == "inspect_events":
         if last_result.get("count", 0) == 0:
-            return {"role": "assistant", "content": "I found no eligible events for this issue and date, so I did not prepare a change."}
+            metrics = next((result for name, result in reversed(completed) if name == "get_campaign_metrics"), {})
+            if issue == "duplicates":
+                attributed = metrics.get("attributed_conversions")
+                unique_orders = metrics.get("unique_order_keys")
+                clean = attributed is not None and unique_orders is not None and attributed == unique_orders
+                detail = f"{attributed} attributed conversions match {unique_orders} unique orders."
+            else:
+                clean = metrics.get("unattributed_conversions") == 0
+                detail = "There are no remaining unattributed conversions."
+            if clean:
+                verification = {"ok": True, "no_change_needed": True, "campaign_id": campaign_id,
+                                "event_date": event_date, "issue": issue, "evidence": detail}
+                return {"role": "assistant", "content": f"No change was needed. {detail}",
+                        "no_change_verification": verification}
+            return {"role": "assistant", "content": "No eligible events matched, but the campaign metrics do not confirm that the issue is clear. I stopped without preparing a change."}
         query = "duplicate conversion deliveries" if issue == "duplicates" else "missing campaign attribution"
         return _tool_step("search_runbooks", {"query": query})
     if last_name == "search_runbooks":
@@ -229,6 +243,12 @@ def run_loop(run_id):
             calls = reply.get("tool_calls") or []
             if not calls:
                 text = reply.get("content") or "The agent ended without a response."
+                no_change_verification = reply.get("no_change_verification")
+                if no_change_verification and no_change_verification.get("ok"):
+                    record_event(run_id, "verification", no_change_verification)
+                    save_run(run_id, status="completed", messages=messages, summary=text, set_pending=True, pending_tool_call_id=None)
+                    record_event(run_id, "completed", {"summary": text, "no_change_needed": True})
+                    break
                 with connection() as conn:
                     verified = conn.execute(
                         """SELECT 1 FROM remediation_actions a
