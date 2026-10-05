@@ -1,5 +1,8 @@
 import json
+import os
 import re
+import urllib.error
+import urllib.request
 from uuid import uuid4
 
 from db import connection
@@ -9,11 +12,63 @@ from tools import (ToolFailure, get_campaign_metrics, inspect_events, list_campa
 
 MAX_TOOL_ROUNDS = 10
 DEMO_DATE = "2026-10-04"
+WORKER_MODE = os.getenv("WORKER_MODE", "ollama").strip().lower()
+LLM_MODEL = os.getenv("LLM_MODEL", "qwen3:8b")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://host.docker.internal:11434/v1").rstrip("/")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "ollama")
 
-SYSTEM_PROMPT = """Local campaign operations workflow. This prompt is retained in the per-run
-audit conversation; execution uses the deterministic policy in this service and never calls
-an external model. Supported repairs require matching campaign and issue intent, evidence from
-the local database and runbook, explicit operator approval, and a successful verification read."""
+SYSTEM_PROMPT = """You are a careful campaign operations worker in a local synthetic-data sandbox.
+Use only the supplied tools to investigate supported issues. Resolve the campaign and date from
+the user's request; the seeded date is 2026-10-04. First list campaigns, read campaign metrics,
+inspect matching event deliveries, and retrieve a relevant runbook. Only prepare a remediation
+when the event evidence and runbook support it. Never claim a change was applied: prepare_remediation
+only creates a preview and pauses for a human. After the user approves, call get_campaign_metrics
+again and report success only if the returned verification says ok=true. If evidence is missing,
+ambiguous, or inconsistent, ask a concise clarification or stop safely. Do not invent campaign IDs,
+event counts, record IDs, or outcomes. Keep tool arguments within the provided schemas."""
+
+TOOLS = [
+    {"type": "function", "function": {"name": "list_campaigns", "description": "List supported local demo campaigns.", "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "get_campaign_metrics", "description": "Read attributed, unique-order, and unattributed conversion metrics for one campaign and date.", "parameters": {"type": "object", "properties": {"campaign_id": {"type": "string"}, "event_date": {"type": "string", "description": "Date in YYYY-MM-DD format"}}, "required": ["campaign_id", "event_date"], "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "inspect_events", "description": "Inspect event deliveries, optionally filtering for duplicates or missing attribution.", "parameters": {"type": "object", "properties": {"campaign_id": {"type": "string"}, "event_date": {"type": "string"}, "issue": {"type": "string", "enum": ["duplicates", "unattributed", "all"]}}, "required": ["campaign_id", "event_date"], "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "search_runbooks", "description": "Search local remediation safety runbooks.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"], "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "prepare_remediation", "description": "Prepare a safe change preview; it pauses for explicit human approval before any write is applied.", "parameters": {"type": "object", "properties": {"action_type": {"type": "string", "enum": ["quarantine_duplicate_deliveries", "repair_unattributed_events"]}, "campaign_id": {"type": "string"}, "event_date": {"type": "string"}}, "required": ["action_type", "campaign_id", "event_date"], "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "ask_clarification", "description": "Ask the user for information required to safely identify the campaign or issue.", "parameters": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"], "additionalProperties": False}}},
+]
+
+
+def call_model(messages):
+    body = json.dumps({"model": LLM_MODEL, "messages": messages, "tools": TOOLS,
+                       "tool_choice": "auto", "temperature": 0.1, "stream": False}).encode("utf-8")
+    request = urllib.request.Request(
+        f"{LLM_BASE_URL}/chat/completions", data=body,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {LLM_API_KEY}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        try:
+            detail = json.loads(detail).get("error", {}).get("message", detail)
+        except (AttributeError, TypeError, ValueError):
+            pass
+        lowered = str(detail).lower()
+        if exc.code == 404 or "model" in lowered and ("not found" in lowered or "pull" in lowered):
+            raise RuntimeError(f"Ollama model '{LLM_MODEL}' is unavailable. Start Ollama and run `ollama pull {LLM_MODEL}`, then retry. Details: {detail}") from exc
+        raise RuntimeError(f"Ollama returned HTTP {exc.code}: {detail}") from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise RuntimeError(f"Cannot reach Ollama at {LLM_BASE_URL}. Start Ollama on this computer and confirm Docker can reach it. Details: {exc}") from exc
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError("Ollama returned an invalid chat-completions response.") from exc
+    try:
+        reply = payload["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError("Ollama response did not include an assistant message.") from exc
+    if not isinstance(reply, dict) or (not reply.get("content") and not reply.get("tool_calls")):
+        raise RuntimeError("Ollama returned an empty assistant response. Try again or select rules mode.")
+    return reply
 
 def _users(messages):
     return [message.get("content", "") for message in messages if message.get("role") == "user"]
@@ -72,8 +127,8 @@ def _clarification(context):
     return _tool_step("ask_clarification", {"question": question})
 
 
-def next_worker_step(messages):
-    """Choose the next bounded local workflow step without calling a model or network."""
+def rules_worker_step(messages):
+    """Choose the next bounded workflow step using the built-in phrase matcher."""
     context = _task_context(messages)
     calls, results = _called_tools(messages)
     if calls and calls[-1]["function"]["name"] == "ask_clarification":
@@ -112,10 +167,10 @@ def next_worker_step(messages):
             if issue == "duplicates":
                 attributed = metrics.get("attributed_conversions")
                 unique_orders = metrics.get("unique_order_keys")
-                clean = attributed is not None and unique_orders is not None and attributed == unique_orders
+                clean = unique_orders is not None and unique_orders > 0 and attributed == unique_orders
                 detail = f"{attributed} attributed conversions match {unique_orders} unique orders."
             else:
-                clean = metrics.get("unattributed_conversions") == 0
+                clean = metrics.get("unique_order_keys", 0) > 0 and metrics.get("unattributed_conversions") == 0
                 detail = "There are no remaining unattributed conversions."
             if clean:
                 verification = {"ok": True, "no_change_needed": True, "campaign_id": campaign_id,
@@ -144,6 +199,20 @@ def next_worker_step(messages):
     if last_result.get("error"):
         return {"role": "assistant", "content": f"I stopped after a tool error: {last_result['error']}"}
     return {"role": "assistant", "content": "The local workflow reached a state it cannot safely continue from."}
+
+
+def next_worker_step(messages):
+    """Use Ollama for tool selection, with a selectable deterministic rules mode."""
+    if WORKER_MODE == "rules":
+        return rules_worker_step(messages)
+    if WORKER_MODE != "ollama":
+        raise RuntimeError("WORKER_MODE must be either 'ollama' or 'rules'.")
+    # Preserve the evidence-based no-op result when a requested date has no eligible events.
+    # This prevents the model from turning an empty date into an unsupported repair proposal.
+    guarded = rules_worker_step(messages)
+    if guarded.get("no_change_verification"):
+        return guarded
+    return call_model(messages)
 
 
 def record_event(run_id, kind, details, tool_name=None):

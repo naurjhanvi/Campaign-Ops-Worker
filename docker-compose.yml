@@ -19,6 +19,10 @@ services:
     build: ./backend
     environment:
       DATABASE_URL: postgresql://worker:worker@db:5432/campaign_ops
+      WORKER_MODE: ${WORKER_MODE:-ollama}
+      LLM_API_KEY: ${LLM_API_KEY:-ollama}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:11434/v1}
+      LLM_MODEL: ${LLM_MODEL:-qwen3:8b}
     ports:
       - "8000:8000"
     depends_on:
