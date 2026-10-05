@@ -178,7 +178,7 @@ def tool_result(run_id, name, arguments):
             result = {"error": "Tool is not available"}
     except (ToolFailure, ValueError) as exc:
         result = {"error": str(exc), "retryable": isinstance(exc, ToolFailure)}
-    if name == "list_campaigns" and result.get("error"):
+    if name == "list_campaigns" and isinstance(result, dict) and result.get("error"):
         with connection() as conn:
             prior_failures = conn.execute(
                 """SELECT count(*) AS n FROM run_events
@@ -253,7 +253,7 @@ def run_loop(run_id):
                 arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
                 result = tool_result(run_id, name, arguments)
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result, default=str)})
-                if result.get("awaiting_approval"):
+                if isinstance(result, dict) and result.get("awaiting_approval"):
                     save_run(run_id, status="awaiting_approval", messages=messages, set_pending=True, pending_tool_call_id=call["id"])
                     record_event(run_id, "approval_requested", result)
                     paused = True
@@ -263,7 +263,7 @@ def run_loop(run_id):
                         record_event(run_id, "tool", {"arguments": {}, "result": canceled}, remaining["function"]["name"])
                     save_run(run_id, messages=messages)
                     break
-                if result.get("needs_input"):
+                if isinstance(result, dict) and result.get("needs_input"):
                     save_run(run_id, status="awaiting_input", messages=messages, summary=result["question"], set_pending=True, pending_tool_call_id=None)
                     record_event(run_id, "clarification_requested", result)
                     paused = True
