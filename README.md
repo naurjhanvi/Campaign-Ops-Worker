@@ -1,3 +1,5 @@
+> **Development update:** After submitting the Google Form, I continued building this project beyond the original time constraint. The current version now uses a local Ollama model to interpret requests and select tools. I did not mention Ollama in the form because this integration was added during that continued development. The approval gate and verification checks are enforced by the application.
+
 # Fieldnote: Campaign Ops Worker
 
 A local campaign operations worker prototype for investigating marketing data incidents. An Ollama model interprets the request and selects from a fixed set of local tools. The worker reads campaign metrics and event deliveries, retrieves a local runbook, proposes a bounded remediation, waits for human approval, applies the change to the local database, and verifies the result.
