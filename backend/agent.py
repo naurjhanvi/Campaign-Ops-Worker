@@ -191,7 +191,7 @@ def tool_result(run_id, name, arguments):
     if name == "get_campaign_metrics" and "error" not in result:
         with connection() as conn:
             action = conn.execute(
-                """SELECT action_type,preview FROM remediation_actions
+                """SELECT action_id,action_type,preview FROM remediation_actions
                    WHERE run_id=%s AND campaign_id=%s AND event_date=%s AND status='applied'
                    ORDER BY executed_at DESC LIMIT 1""",
                 (run_id, arguments["campaign_id"], arguments["event_date"]),
