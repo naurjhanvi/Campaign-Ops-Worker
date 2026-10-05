@@ -93,10 +93,11 @@ def next_worker_step(messages):
     if last_name is None or last_name == "ask_clarification":
         return _tool_step("list_campaigns", {})
     if last_name == "list_campaigns":
-        if last_result.get("retryable"):
-            return _tool_step("list_campaigns", {})
-        if last_result.get("error"):
-            return {"role": "assistant", "content": f"I stopped because campaign data could not be read: {last_result['error']}"}
+        if isinstance(last_result, dict):
+            if last_result.get("retryable"):
+                return _tool_step("list_campaigns", {})
+            if last_result.get("error"):
+                return {"role": "assistant", "content": f"I stopped because campaign data could not be read: {last_result['error']}"}
         matches = [campaign for campaign in last_result if campaign["campaign_id"] == campaign_id]
         if len(matches) != 1:
             return _clarification(context)
